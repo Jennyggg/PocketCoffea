@@ -39,6 +39,7 @@ class HistConf:
     exclude_categories: List[str] = None
     only_categories: List[str] = None
     no_weights: bool = False  # Do not fill the weights
+    extra_weight: str = None  # Optional: name of a per-event field in `events` to multiply into the weight
     metadata_hist: bool = False  # Non-event variables, for processing metadata
     hist_obj = None
     collapse_2D_masks = False  # if 2D masks are applied on the events
@@ -196,7 +197,8 @@ class HistManager:
             self.available_shape_variations_bysubsample_bycat = None
             
             
-        if self.isMC:
+        #if self.isMC:
+        if True:
             # Weights variations
             # This is checking only the full samples weights
             for cat, weights in self.variations_config["weights"].items():
@@ -324,7 +326,8 @@ class HistManager:
                 )
 
                 # Axis in the configuration + custom axes
-                if self.isMC:
+                #if self.isMC:
+                if True:
                     all_axes = [cat_ax, var_ax]
                 else:
                     # no variation axis for data
@@ -554,7 +557,8 @@ class HistManager:
                     # Ok, now we have all the numerical axes with
                     # data that has been masked, flattened
                     # removed the none value --> now we need weights for each variation
-                    if not histo.no_weights and self.isMC:
+                    #if not histo.no_weights and self.isMC:
+                    if not histo.no_weights:
                         if shape_variation == "nominal":
                             # if we are working on nominal we fill all the weights variations
                             for variation in histo.hist_obj.axes["variation"]:
@@ -611,6 +615,26 @@ class HistManager:
                                         data_structure,
                                     )
 
+                                # Apply per-histogram extra weight modifier (per-event field)
+                                if histo.extra_weight is not None:
+                                    _ew = ak.to_numpy(events[histo.extra_weight][mask])
+                                    if data_structure is not None:
+                                        _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                                    _notnone = ak.to_numpy(all_axes_isnotnone)
+                                    weight_varied = weight_varied[_notnone] * _ew[_notnone]
+                                    try:
+                                        self.histograms[subsample][name].hist_obj.fill(
+                                            cat=category,
+                                            variation=variation,
+                                            weight=weight_varied,
+                                            **{**fill_categorical, **fill_numeric_masked},
+                                        )
+                                    except Exception as e:
+                                        raise Exception(
+                                            f"Cannot fill histogram: {name}, {histo} {e}"
+                                        )
+                                    continue
+
                                 # Then we apply the notnone mask
                                 weight_varied = weight_varied[ak.to_numpy(all_axes_isnotnone)]
                                 # Fill the histogram
@@ -633,7 +657,7 @@ class HistManager:
                                 # We cannot fill just with the nominal, because we are running the shape
                                 # variation and the observable hist will be different, also if with nominal weights.
                                 continue
-                                
+
                             # Working on shape variation! only nominal weights
                             # (also using the cache which is cleaned for each shape variation
                             # at the beginning of the function)
@@ -644,7 +668,7 @@ class HistManager:
                                 )
                             else:
                                 weight_sub = 1.
-                                
+
                             weight_nom = self.mask_and_broadcast_weight(
                                 category,
                                 subsample,
@@ -653,7 +677,7 @@ class HistManager:
                                 mask,
                                 data_structure,
                             )
-                            
+
                             if custom_weight != None and name in custom_weight:
                                 weight_nom = weight_nom * self.mask_and_broadcast_weight(
                                     category + "customW",
@@ -665,6 +689,25 @@ class HistManager:
                                     mask,
                                     data_structure,
                                 )
+                            # Apply per-histogram extra weight modifier (per-event field)
+                            if histo.extra_weight is not None:
+                                _ew = ak.to_numpy(events[histo.extra_weight][mask])
+                                if data_structure is not None:
+                                    _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                                _notnone = ak.to_numpy(all_axes_isnotnone)
+                                weight_nom = weight_nom[_notnone] * _ew[_notnone]
+                                try:
+                                    self.histograms[subsample][name].hist_obj.fill(
+                                        cat=category,
+                                        variation=shape_variation,
+                                        weight=weight_nom,
+                                        **{**fill_categorical, **fill_numeric_masked},
+                                    )
+                                except Exception as e:
+                                    raise Exception(
+                                        f"Cannot fill histogram: {name}, {histo} {e}"
+                                    )
+                                continue
                             # Then we apply the notnone mask
                             weight_nom = weight_nom[all_axes_isnotnone]
                             # Fill the histogram
@@ -703,20 +746,38 @@ class HistManager:
                                 data_structure,
                             )
 
-                        # Then we apply the notnone mask
-                        weight_data = weight_data[ak.to_numpy(all_axes_isnotnone)]
-                        # Fill the histogram
-                        try:
-                            # Data histograms don't have variations but now can be weighted
-                            self.histograms[subsample][name].hist_obj.fill(
-                                cat=category,
-                                weight=weight_data,
-                                **{**fill_categorical, **fill_numeric_masked},
-                            )
-                        except Exception as e:
-                            raise Exception(
-                                f"Cannot fill histogram for Data: {name}, {histo} {e}"
-                            )
+                        # Apply per-histogram extra weight modifier (per-event field)
+                        if histo.extra_weight is not None:
+                            _ew = ak.to_numpy(events[histo.extra_weight][mask])
+                            if data_structure is not None:
+                                _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                            _notnone = ak.to_numpy(all_axes_isnotnone)
+                            weight_data = weight_data[_notnone] * _ew[_notnone]
+                            try:
+                                self.histograms[subsample][name].hist_obj.fill(
+                                    cat=category,
+                                    weight=weight_data,
+                                    **{**fill_categorical, **fill_numeric_masked},
+                                )
+                            except Exception as e:
+                                raise Exception(
+                                    f"Cannot fill histogram for Data: {name}, {histo} {e}"
+                                )
+                        else:
+                            # Then we apply the notnone mask
+                            weight_data = weight_data[ak.to_numpy(all_axes_isnotnone)]
+                            # Fill the histogram
+                            try:
+                                # Data histograms don't have variations but now can be weighted
+                                self.histograms[subsample][name].hist_obj.fill(
+                                    cat=category,
+                                    weight=weight_data,
+                                    **{**fill_categorical, **fill_numeric_masked},
+                                )
+                            except Exception as e:
+                                raise Exception(
+                                    f"Cannot fill histogram for Data: {name}, {histo} {e}"
+                                )
 
                     ######################################################
                     elif (

@@ -395,7 +395,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 mask_on_events = mask
 
             self.output["cutflow"][category].setdefault(self._dataset, {}).setdefault(self._sample, {})[variation] = ak.sum(mask_on_events)
-            if self._isMC:
+            #if self._isMC:
+            if True:
                 w = self.weights_manager.get_weight(category)
                 self.output["sumw"][category].setdefault(self._dataset, {}).setdefault(self._sample, {})[variation] = ak.sum(w * mask_on_events)
                 self.output["sumw2"][category].setdefault(self._dataset, {}).setdefault(self._sample, {})[variation] = ak.sum((w**2) * mask_on_events)
@@ -406,7 +407,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                     # get the subsample specific weight
                     mask_withsub = mask_on_events & subsam_mask
                     self.output["cutflow"][category].setdefault(self._dataset, {}).setdefault(f"{self._sample}__{subs}", {})[variation] = ak.sum(mask_withsub)
-                    if self._isMC:
+                    #if self._isMC:
+                    if True:
                         w_tot = w * self.weights_manager.get_weight_only_subsample(subsample=f"{self._sample}__{subs}",
                                                                                    category=category)
                         self.output["sumw"][category].setdefault(self._dataset, {}).setdefault(f"{self._sample}__{subs}", {})[variation] = ak.sum(w_tot * mask_withsub)
@@ -440,7 +442,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             self._hasSubsamples,
             self._subsamples[self._sample].keys(),
             self._categories,
-            variations_config=self.cfg.variations_config[self._sample] if self._isMC else None,
+            variations_config=self.cfg.variations_config[self._sample] if self._sample in self.cfg.variations_config.keys() else None,
             processor_params=self.params,
             weights_manager=self.weights_manager,
             calibrators_manager=self.calibrators_manager,
@@ -508,7 +510,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 self.column_managers[subs] = ColumnsManager(
                     self._columns[name],
                     self._categories,
-                    variations_config=self.cfg.variations_config[self._sample] if self._isMC else None,
+                    variations_config=self.cfg.variations_config[self._sample],
                 )
 
     def define_column_accumulators_extra(self):
@@ -608,7 +610,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
     def save_processing_metadata(self):
         # Filling the special histograms for processing metadata if they are present
         total_processing_time = self.stop_time - self.start_time # in seconds
-        add_axes = {"variation":"nominal"} if self._isMC else {}  
+        add_axes = {"variation":"nominal"}
         if self._hasSubsamples:
             for subs in self._subsamples[self._sample].keys():
                 for k, n in zip(["initial", "skim","presel"],

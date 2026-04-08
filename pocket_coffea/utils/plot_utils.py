@@ -141,6 +141,7 @@ class Style:
             return {
                 "year" : "years",
                 "cat" : "categories",
+                "variation" : "variations",
                 "era" : "eras"
             }
 
@@ -428,6 +429,7 @@ class Shape:
             ), f"{self.name}: Not all the data histograms have the same dimension."
             # Load categorical axes for data histograms
             for ax in self.categorical_axes_data:
+                print("ax.name",ax.name)
                 setattr(
                     self,
                     self.style.categorical_axes_data[
@@ -482,9 +484,9 @@ class Shape:
                 if not type(ax) in [hist.axis.StrCategory, hist.axis.IntCategory]:
                     dense_axes_dict[s].append(ax)
         dense_axes = list(dense_axes_dict.values())
-        assert all(
-            v == dense_axes[0] for v in dense_axes
-        ), "Not all the histograms in the dictionary have the same dense dimension."
+        #assert all(
+        #/    v == dense_axes[0] for v in dense_axes
+        #), "Not all the histograms in the dictionary have the same dense dimension."
         dense_axes = dense_axes[0]
 
         return dense_axes
@@ -526,6 +528,7 @@ class Shape:
                 categories_sorted[axis_name] = cats
 
         # Use the union of sets to define categorical_axes
+        print("categorical_axes_dict",categorical_axes_dict)
         for i, (axis_name, categories) in enumerate(categorical_axes_dict.items()):
             for s, h in d.items():
                 ax = [ax for ax in h.axes if ax.name == axis_name][0]
@@ -533,6 +536,7 @@ class Shape:
                 if categories_per_sample != categories:
                     if len(categorical_axes_dict) != 2:
                         raise NotImplementedError("The number of categorical axes is different from 2. This case is not implemented yet. Only the axes `cat` and `variation` are supported.")
+                    if axis_name == "cat": continue
                     if not axis_name == "variation":
                         raise NotImplementedError(f"The axis `variation` is the only axis that could differ across samples. The axis `{axis_name}` is not supported.")
                     categories_missing = categories - categories_per_sample
@@ -550,6 +554,7 @@ class Shape:
                     warn_msg = f"WARNING: Sample {s} is missing variations in the axis `{axis_name}`. Filling the {axis_name} with nominal values.\nMissing variations: {categories_missing}"
                     warn_flag = False
                     for category_other in categorical_axes_dict[axis_name_other]:
+                        if category_other not in axis_other: continue
                         index_other = axis_other.index(category_other)
                         for category in categories:
                             index_category = axis_new.index(category)
@@ -591,16 +596,19 @@ class Shape:
             for s, h in d.items():
                 ax = [ax for ax in h.axes if ax.name == axis_name][0]
                 categories_per_sample = {ax.value(i) for i in range(len(ax))}
+                print("categories_per_sample", categories_per_sample)
+                print("categories", categories)
                 if categories_per_sample != categories:
-                    if not is_mc:
-                        raise NotImplementedError("The data histograms have different categories. This case is not implemented yet.")
+                    #if not is_mc:
+                    #    raise NotImplementedError("The data histograms have different categories. This case is not implemented yet.")
                     if len(categorical_axes_dict) != 2:
                         raise NotImplementedError("The number of categorical axes is different from 2. This case is not implemented yet. Only the axes `cat` and `variation` are supported.")
+                    if axis_name == "cat": continue
                     if not axis_name == "variation":
                         raise NotImplementedError(f"The axis `variation` is the only axis that could differ across samples. The axis `{axis_name}` is not supported.")
                     categories_missing = categories - categories_per_sample
                     error_msg += f"{axis_name}\n" + f"Missing categories: {categories_missing}"
-                    raise Exception(error_msg)
+                    #raise Exception(error_msg)
 
         h0 = self.h_dict[list(d.keys())[0]]
         categorical_axes = [ax for ax in h0.axes if type(ax) in [hist.axis.StrCategory, hist.axis.IntCategory]]
@@ -690,7 +698,7 @@ class Shape:
                 for dataset in datasets:
                     if dataset not in self.datasets_metadata:
                         raise Exception(f"Dataset `{dataset}` not found in datasets metadata!")
-                    isMC_d = self.datasets_metadata[dataset]["isMC"] == "True"
+                    isMC_d = "True" in str(self.datasets_metadata[dataset].get("isMC", "False")) and "False" not in str(self.datasets_metadata[dataset].get("isMC", "False"))
                     if isMC is None:
                         isMC = isMC_d
                         self.sample_is_MC[sample] = isMC
@@ -868,6 +876,8 @@ class Shape:
                         )
                     else:
                         slicing_data = {'cat': cat}
+                if 'variation' in [ax.name for ax in self.categorical_axes_data]:
+                    slicing_data['variation'] = 'nominal'
                 self.h_dict_data = {
                     d: self.h_dict[d][slicing_data] for d in self.samples_data
                 }
@@ -1227,6 +1237,9 @@ class Shape:
         if self.density:
             y = y / integral
             yerr = yerr / integral
+        print("self.style.opts_axes['xcenters']",self.style.opts_axes['xcenters'])
+        print("y",y)
+
         self.ax.errorbar(self.style.opts_axes["xcenters"], y, yerr=yerr, **self.style.opts_data)
         self.format_figure(cat, ratio=False)
 

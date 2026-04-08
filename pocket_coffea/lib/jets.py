@@ -573,10 +573,21 @@ def jet_correction_corrlib(
             jets["mass_JER_down"] = jets.mass * jersmear
         if apply_jer:
             # to avoid the sf: jer*jer_up or jer*jer_down, update the jer pt/mass after calculation of the jer up/down
+            jets["pt_sf_jer"] = ak.where(
+                    jets.pt != 0,
+                    jets["pt_jer"]/jets["pt"],
+                    0,
+                    )
+            jets["mass_sf_jer"] = ak.where(
+                    jets.mass != 0,
+                    jets["mass_jer"]/jets["mass"],
+                    0,
+                    )
             jets["pt"] = jets["pt_jer"]
             jets["mass"] = jets["mass_jer"]
 
     # jes systematics
+
     if jes_syst:
         # update evaluate dictionary
         eval_dict.update({"JetPt": jets.pt})

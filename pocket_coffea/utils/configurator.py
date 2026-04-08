@@ -236,10 +236,10 @@ class Configurator:
         # They define the strings available for the variation configuration
         # The full list of variations are defined for each chunk and specialized by era
         # when the calibrator is instantiated.
-        self.available_calibrators_variations = []
+        self.available_calibrators_variations = {}
         for calibrator in self.calibrators:
             if calibrator.has_variations:
-                self.available_calibrators_variations.append(calibrator.name)
+                self.available_calibrators_variations[calibrator.name] = calibrator
 
         ## Variations configuration
         # The structure is very similar to the weights one,
@@ -256,7 +256,7 @@ class Configurator:
                 }if self.has_subsamples[s] else {}
             }
             for s in self.samples
-            if self.samples_metadata[s]["isMC"]
+            #if self.samples_metadata[s]["isMC"]
         }
         
         if "shape" not in self.variations_cfg:
@@ -270,14 +270,18 @@ class Configurator:
         self.available_shape_variations = {s: [] for s in self.samples}
         for sample in self.samples:
             # skipping variations for data
-            if not self.samples_metadata[sample]["isMC"]:
-                continue
+            #if not self.samples_metadata[sample]["isMC"]:
+            #    continue
             # Weights variations
             for cat, vars in self.variations_config[sample]["weights"].items():
-                self.available_weights_variations[sample] += vars
+                for var in vars:
+                    if self.samples_metadata[sample]["isMC"] or not self.available_weights[var].isMC_only:
+                        self.available_weights_variations[sample].append(var)
             # Shape variations
             for cat, vars in self.variations_config[sample]["shape"].items():
-                self.available_shape_variations[sample] += vars
+                for var in vars:
+                    if self.samples_metadata[sample]["isMC"]:
+                        self.available_shape_variations[sample].append(var)
             # make them unique
             self.available_weights_variations[sample] = list(
                 set(self.available_weights_variations[sample])
@@ -549,6 +553,8 @@ class Configurator:
                 print("Available variations: ", available_variations)
                 raise Exception(f"Wrong variation configuration: variation {w} not available in the workflow")
             for sample, wsample in self.variations_config.items():
+                if not self.samples_metadata[sample]["isMC"] and available_variations[w].isMC_only:
+                    continue
                 if variation_type == "weights" and w not in self.weights_config[sample]["inclusive"]:
                     print(f"Error: variation {w} not available for sample {sample} in inclusive category")
                     raise Exception(f"Wrong variation configuration: variation {w} not available for sample {sample} in inclusive category")
