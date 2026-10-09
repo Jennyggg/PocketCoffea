@@ -68,11 +68,13 @@ class DataProcess(Process):
     :param samples: Iterable of sample names associated with the process
     :param years: Iterable of years the process is relevant for
     :param label: Label for the process, defaults to `name` if not specified
+    :param round_counts: Flag to indicate if counts should be rounded to integers, defaults to False
 
     Inherits from Process and sets is_data to True by default.
     """
 
     years: Iterable
+    round_counts: bool = False
 
     def __post_init__(self):
         self.is_data = True
@@ -89,6 +91,14 @@ class MCProcesses(dict[str, MCProcess]):
     def __init__(self, processes: list[MCProcess]) -> None:
         if not all(isinstance(process, MCProcess) for process in processes):
             raise TypeError(f"All elements of {processes} must be of type MCProcess")
+        # A dict comprehension silently drops all but the last process sharing a name.
+        names = [process.name for process in processes]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise ValueError(
+                f"Duplicate MC process name(s): {duplicates}. "
+                "Each MCProcess must have a unique name."
+            )
         super().__init__({process.name: process for process in processes})
 
     @property

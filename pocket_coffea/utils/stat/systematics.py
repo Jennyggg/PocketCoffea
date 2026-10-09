@@ -11,11 +11,25 @@ class SystematicUncertainty:
     Store information about one systematic uncertainty.
 
     :param name: Name of the systematic uncertainty.
-    :param typ: Type of the systematic uncertainty (e.g. 'shape', 'lnN').
+    :param typ: Type of the systematic uncertainty as written in the datacard: 'lnN' or one of
+        the Combine shape flavours 'shape', 'shapeN', 'shapeU', 'shape?'. All shape flavours
+        need Up/Down templates and are handled alike; only the datacard line differs.
     :param processes: List or tuple of process names affected, or a dict mapping process names to values.
     :param years: List or tuple of years the uncertainty applies to.
     :param value: Value (float or tuple of floats) of the uncertainty for all processes, or None if using a dict for processes.
     :param datacard_name: Name of the systematic uncertainty in the datacard. Defaults to `name` if not specified.
+    :param coffea_name_alias: Name of the shape variation as stored in the coffea output histograms.
+        Use this when the coffea variation name differs from the canonical `name` — most
+        commonly when one logical systematic is recorded under *different* names per
+        process (e.g. parton-shower weights named differently for different generators).
+        Can be a single string applied to all processes, or a dict mapping process names
+        to per-process alias strings. Processes missing from the dict fall back to `name`.
+        Defaults to `name` if not specified.
+
+        Note: as a plain string this field is largely redundant with `name` — if you only
+        need a global rename, just set `name` to the coffea variation name and let
+        `datacard_name` carry the datacard-side label. `coffea_name_alias` earns its keep
+        in the dict form, where the alias varies by process.
     """
 
     name: str
@@ -24,6 +38,7 @@ class SystematicUncertainty:
     years: list[str] | tuple[str]
     value: float | tuple[float] = None
     datacard_name: str = None
+    coffea_name_alias: str | dict[str, str] = None
 
     def __post_init__(self):
         if self.value is None and not isinstance(self.processes, dict):
@@ -58,6 +73,18 @@ class SystematicUncertainty:
         if self.datacard_name is None:
             self.datacard_name = self.name
 
+        if self.coffea_name_alias is None:
+            self.coffea_name_alias = self.name
+
+    def get_coffea_name(self, process: str) -> str:
+        """Return the coffea variation alias for a given process.
+
+        Falls back to `name` when a dict alias does not list `process`.
+        """
+        if isinstance(self.coffea_name_alias, dict):
+            return self.coffea_name_alias.get(process, self.name)
+        return self.coffea_name_alias
+
 
 class Systematics(dict[str, SystematicUncertainty]):
     """Store information of a list of systematic uncertainties"""
@@ -71,6 +98,18 @@ class Systematics(dict[str, SystematicUncertainty]):
         if not all(isinstance(syst, SystematicUncertainty) for syst in systematics):
             raise TypeError(
                 f"All elements of {systematics} must be of type SystematicUncertainty"
+            )
+        # Building the dict by comprehension silently drops all but the last entry when
+        # two systematics share a datacard_name (a natural mistake when declaring the
+        # same systematic for different year/process lists), making a nuisance vanish
+        # from the card. Detect the collision instead.
+        names = [systematic.datacard_name for systematic in systematics]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise ValueError(
+                f"Duplicate systematic datacard_name(s): {duplicates}. "
+                "Each SystematicUncertainty must have a unique datacard_name; merge "
+                "the process/year lists into a single declaration instead."
             )
         super().__init__(
             {systematic.datacard_name: systematic for systematic in systematics}
@@ -92,13 +131,21 @@ class Systematics(dict[str, SystematicUncertainty]):
         """Number of Systematics"""
         return len(self.keys())
 
+    @staticmethod
+    def _is_type(syst: SystematicUncertainty, syst_type: str) -> bool:
+        # "shape" covers every Combine shape flavour (shape, shapeN, shapeU, shape?):
+        # they all carry Up/Down templates and only differ in the datacard line.
+        if syst_type == "shape":
+            return syst.typ.startswith("shape")
+        return syst.typ == syst_type
+
     def list_type(self, syst_type: str) -> list[str]:
-        """List of Names of Systematics of a specific type."""
-        return [key for key in self if self[key].typ == syst_type]
+        """List of Names of Systematics of a specific type ("shape" matches all shape flavours)."""
+        return [key for key in self if self._is_type(self[key], syst_type)]
 
     def get_systematics_by_type(self, syst_type: str) -> dict[SystematicUncertainty]:
-        """Dict of Systematics of a specific type."""
-        return {name: syst for name, syst in self.items() if syst.typ == syst_type}
+        """Dict of Systematics of a specific type ("shape" matches all shape flavours)."""
+        return {name: syst for name, syst in self.items() if self._is_type(syst, syst_type)}
 
     def get_systematics_by_process(
         self, process: Process

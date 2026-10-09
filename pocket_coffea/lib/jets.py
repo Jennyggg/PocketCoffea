@@ -1,11 +1,20 @@
+import functools
 import gzip
 import cloudpickle
 import awkward as ak
 import numpy as np
 import correctionlib
+from pocket_coffea.lib.correction_cache import load_correction_set
 from coffea.jetmet_tools import  CorrectedMETFactory
 from correctionlib.schemav2 import Correction, CorrectionSet
 from ..utils.utils import get_nano_version, replace_at_indices
+
+
+def get_rho(events, nano_version):
+    if nano_version >= 12:
+        return events.Rho.fixedGridRhoFastjetAll
+    else:
+        return events.fixedGridRhoFastjetAll
 
 
 def add_jec_variables(jets, event_rho, isMC=True, gen_match_dr=None, nomatch_value=0.0):
@@ -16,10 +25,19 @@ def add_jec_variables(jets, event_rho, isMC=True, gen_match_dr=None, nomatch_val
     expects -1 (0 falls in its scaling bin [0, 1) and gives factor = JERsf).
     ``gen_match_dr``: when set, the NanoAOD gen match is also required to satisfy
     dR < gen_match_dr (JME recommendation: R/2), otherwise the jet counts as unmatched.
-    (Backport of PocketCoffea PR #571.)
     """
-    jets["pt_raw"] = (1 - jets.rawFactor) * jets.pt
-    jets["mass_raw"] = (1 - jets.rawFactor) * jets.mass
+    # Check if pt is defined, if not take the rawPt
+    if "pt" not in jets.fields:
+        jets["pt"] = jets.rawPt
+        jets["pt_raw"] = jets.rawPt
+        if "rawMass" in jets.fields:    
+            jets["mass_raw"] = jets.rawMass
+        else:
+            # NanoAODv12 does not have rawMass for corrT1METjet
+            jets["mass_raw"] = ak.zeros_like(jets.rawPt)
+    else:
+        jets["pt_raw"] = (1 - jets.rawFactor) * jets.pt
+        jets["mass_raw"] = (1 - jets.rawFactor) * jets.mass
     jets["event_rho"] = ak.broadcast_arrays(event_rho, jets.pt)[0]
     if isMC:
         try:
@@ -99,7 +117,7 @@ def jet_selection(events, jet_type, params, year, leptons_collection="", jet_tag
     # For nanoV12 (i.e. 22/23), jet Id is also buggy, should therefore be rederived
     # in the following, if nano_version not explicitly specified in params, v9 is assumed for Run2UL, v12 for 22/23 and v15 for 2024
     jets["jetId_corrected"] = compute_jetId(events, jet_type, params, year)
-
+    nano_version = get_nano_version(events, params, year)
     # Mask for  jets not passing the preselection
     mask_presel = (
         (jets.pt > cuts["pt"])
@@ -116,7 +134,7 @@ def jet_selection(events, jet_type, params, year, leptons_collection="", jet_tag
 
     if jet_type == "Jet":
         # Selection on PUid. Only available in Run2 UL, thus we need to determine which sample we run over;
-        if year in ['2016_PreVFP', '2016_PostVFP','2017','2018']:
+        if year in ['2016_PreVFP', '2016_PostVFP','2017','2018'] and nano_version <= 9:
             mask_jetpuid = (jets.puId >= params.jet_scale_factors.jet_puId[year]["working_point"][cuts["puId"]["wp"]]) | (
                 jets.pt >= cuts["puId"]["maxpt"]
             )
@@ -222,12 +240,153 @@ def compute_jetId(events, jet_type, params, year):
         else:
             raise ValueError(f"Jet type {jet_type} not recognized for JetID")
 
+    # nanoAOD = v15 and Run2 (2016)
+    elif year == '2016_PreVFP_v15' or year == '2016_PostVFP_v15':
+
+         ### Following this code: https://twiki.cern.ch/twiki/bin/viewauth/CMS/JetID13TeVUL?extralog=-%20caching%20topic#NanoAODv15
+
+         counts = ak.num(jets)
+         jets = ak.flatten(jets, axis=1)
+
+         eval_dict = {
+             "eta": jets.eta,
+             "chHEF": jets.chHEF,
+             "neHEF": jets.neHEF,
+             "chEmEF": jets.chEmEF,
+             "neEmEF": jets.neEmEF,
+             "muEF": jets.muEF,
+             "chMultiplicity": jets.chMultiplicity,
+             "neMultiplicity": jets.neMultiplicity,
+             "multiplicity": jets.chMultiplicity + jets.neMultiplicity
+         }
+
+         idTight_region_1 = (
+                            (abs(jets.eta) <= 2.4)
+                            & (jets.neHEF < 0.9)
+                            & (jets.neEmEF < 0.9)
+                            & (jets.chMultiplicity+jets.neMultiplicity > 1)
+                            & (jets.chHEF > 0.0)
+                            & (jets.chMultiplicity > 0)
+                            )
+
+         idTight_region_2 = (
+                            ((abs(jets.eta) > 2.4) & (abs(jets.eta) <= 2.7))
+                            & (jets.neHEF < 0.98)
+                            & (jets.neEmEF < 0.99)
+                            )
+
+         idTight_region_3 = (
+                            ((abs(jets.eta) > 2.7) & (abs(jets.eta) <= 3.0))
+                            & (jets.neMultiplicity >= 1)
+                            )
+
+         idTight_region_4 = (
+                            (abs(jets.eta) > 3.0)
+                            & (jets.neMultiplicity > 2)
+                            & (jets.neEmEF < 0.9)
+                            )
+
+         idTight = idTight_region_1 | idTight_region_2 | idTight_region_3 | idTight_region_4
+
+         idTightLepVeto_region_1 = (
+                                    (abs(jets.eta) <= 2.4)
+                                    & (idTight)
+                                    & (jets.muEF < 0.8)
+                                    & (jets.chEmEF < 0.8)
+                                    )
+        
+         idTightLepVeto_region_2 = (
+                                    (abs(jets.eta) > 2.4)
+                                    & (idTight)
+                                    )
+
+         idTightLepVeto = idTightLepVeto_region_1 | idTightLepVeto_region_2
+
+         idTight_value = idTight * 2          # bit2
+         idTightLepVeto_value = idTightLepVeto * 4   # bit3
+
+         id_value = idTight_value + idTightLepVeto_value
+
+         return ak.unflatten(id_value, counts)
+
+
+
+    # nanoAOD = v15 and Run2 (2017 - 2018)
+    elif year == '2017_v15' or year == '2018_v15':
+
+         ### Following this code: https://twiki.cern.ch/twiki/bin/viewauth/CMS/JetID13TeVUL?extralog=-%20caching%20topic#NanoAODv15
+
+         counts = ak.num(jets)
+         jets = ak.flatten(jets, axis=1)
+
+         eval_dict = {
+             "eta": jets.eta,
+             "chHEF": jets.chHEF,
+             "neHEF": jets.neHEF,
+             "chEmEF": jets.chEmEF,
+             "neEmEF": jets.neEmEF,
+             "muEF": jets.muEF,
+             "chMultiplicity": jets.chMultiplicity,
+             "neMultiplicity": jets.neMultiplicity,
+             "multiplicity": jets.chMultiplicity + jets.neMultiplicity
+         }
+        
+        
+         idTight_region_1 = (
+                            (abs(jets.eta) <= 2.6)
+                            & (jets.neHEF < 0.9)
+                            & (jets.neEmEF < 0.9)
+                            & (jets.chMultiplicity+jets.neMultiplicity > 1)
+                            & (jets.chHEF > 0.0)
+                            & (jets.chMultiplicity > 0)
+                            )
+
+         idTight_region_2 = (
+                            ((abs(jets.eta) > 2.6) & (abs(jets.eta) <= 2.7))
+                            & (jets.neHEF < 0.90)
+                            & (jets.neEmEF < 0.99)
+                            )
+
+         idTight_region_3 = (
+                            ((abs(jets.eta) > 2.7) & (abs(jets.eta) <= 3.0))
+                            & (jets.neHEF < 0.9999)
+                            )
+
+         idTight_region_4 = (
+                            (abs(jets.eta) > 3.0)
+                            & (jets.neMultiplicity > 2)
+                            & (jets.neEmEF < 0.9)
+                            )
+
+         idTight = idTight_region_1 | idTight_region_2 | idTight_region_3 | idTight_region_4
+
+         idTightLepVeto_region_1 = (
+                                    (abs(jets.eta) <= 2.7)
+                                    & (idTight)
+                                    & (jets.muEF < 0.8)
+                                    & (jets.chEmEF < 0.8)
+                                    )
+        
+         idTightLepVeto_region_2 = (
+                                    (abs(jets.eta) > 2.7)
+                                    & (idTight)
+                                    )
+
+         idTightLepVeto = idTightLepVeto_region_1 | idTightLepVeto_region_2
+
+         idTight_value = idTight * 2          # bit2
+         idTightLepVeto_value = idTightLepVeto * 4   # bit3
+
+         id_value = idTight_value + idTightLepVeto_value
+
+         return ak.unflatten(id_value, counts)
+
 
     elif nano_version >= 15:
         # Example code: https://gitlab.cern.ch/cms-nanoAOD/jsonpog-integration/-/blob/master/examples/jetidExample.py?ref_type=heads
         # Load CorrectionSet
         jsonFile = params.jet_scale_factors.jet_id[year]
-        cset = correctionlib.CorrectionSet.from_file(jsonFile)
+        cset = load_correction_set(jsonFile)
 
         counts = ak.num(jets)
         jets = ak.flatten(jets, axis=1)
@@ -244,13 +403,15 @@ def compute_jetId(events, jet_type, params, year):
             "multiplicity": jets.chMultiplicity + jets.neMultiplicity
         }
 
+            
         ## Default tight for NanoAOD version 13 and above
         jet_algo_mapping = params.jets_calibration.collection[year]
         jet_algo = next((k for k, v in jet_algo_mapping.items() if v == jet_type), None)
         if jet_algo==None:
             raise Exception(f"No mapping jet_type ({jet_type}) -> jet_algo (e.g. AK4PFPuppi) defined for year {year}")
+        if "AK4PFPuppi" in jet_algo: jet_algo = "AK4PFPuppi"
         jet_algo = jet_algo.replace("PF", "").upper()
-    
+
         if jet_algo+"_Tight" not in list(cset.keys()):
             raise Exception(f"No correction for jet collection {jet_algo} defined in correctionlib file {jsonFile}")
         idTight = cset[jet_algo+"_Tight"]
@@ -268,11 +429,200 @@ def compute_jetId(events, jet_type, params, year):
         return ak.unflatten(id_value, counts)
 
 
+def get_btag_wp_threshold(btag, wp, tagger=None):
+    """Return the numeric threshold of a working point, resolving the tagger.
+
+    ``btag`` is the per-year b-tagging block ``btagging.working_point.<year>``.
+    Both the flat (``btagging_WP: {L: ...}``) and the nested-by-tagger
+    (``btagging_WP: {<tagger>: {L: ...}}``) layouts are supported.
+
+    Args:
+        btag: the per-year b-tagging parameters block.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``).
+        tagger: b-tag discriminant branch. When ``None`` it is taken from
+            ``btag["btagging_algorithm"]``.
+
+    Returns:
+        float: the discriminant threshold for the working point.
+    """
+    if tagger is None:
+        tagger = btag["btagging_algorithm"]
+    wps = btag["btagging_WP"]
+    return wps[tagger][wp] if tagger in wps else wps[wp]
+
+
 def btagging(Jet, btag, wp, veto=False):
+    tagger = btag["btagging_algorithm"]
+    threshold = get_btag_wp_threshold(btag, wp, tagger)
     if veto:
-        return Jet[Jet[btag["btagging_algorithm"]] < btag["btagging_WP"][wp]]
+        return Jet[Jet[tagger] < threshold]
     else:
-        return Jet[Jet[btag["btagging_algorithm"]] > btag["btagging_WP"][wp]]
+        return Jet[Jet[tagger] > threshold]
+
+
+def get_btag_wp_score(params, year, wp, tagger):
+    """Read a b-tag working-point discriminant cut from the BTV correctionlib JSON.
+
+    The score is taken directly from the same ``btagging.json.gz`` that provides
+    the shape SF (``jet_scale_factors.btagSF.<year>.file``), so the cut applied to
+    the jets and the SF applied to them always refer to the same tagger and
+    campaign. The BTV file exposes the working-point values under a
+    ``<tagger>_wp_values`` correction (see ``btagging.btag_wp_values_map`` in the parameters YAML).
+
+    Args:
+        params: PocketCoffea parameters (with the ``jet_scale_factors`` section).
+        year: data-taking year key used to index ``jet_scale_factors.btagSF``.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``).
+        tagger: b-tag discriminant branch (e.g. ``"btagPNetB"``), selecting which
+            per-tagger ``_wp_values`` correction to read.
+
+    Returns:
+        float: the discriminant cut value for the working point.
+    """
+    btagSF = params["jet_scale_factors"]["btagSF"][year]
+    cset = load_correction_set(btagSF["file"])
+    wp_values_map = params["btagging"]["btag_wp_values_map"]
+    corr_name = wp_values_map.get(tagger)
+    if corr_name is None:
+        raise KeyError(
+            f"No BTV working-point-values correction is known for tagger '{tagger}'. "
+            f"Known taggers: {sorted(wp_values_map)}."
+        )
+    if corr_name not in cset:
+        raise KeyError(
+            f"Correction '{corr_name}' not found in b-tagging file "
+            f"'{btagSF['file']}'. Available corrections: {list(cset)}."
+        )
+    return float(cset[corr_name].evaluate(wp))
+
+
+def get_btag_working_point(params, year, wp="L", tagger=None):
+    """Resolve the b-tag discriminant branch and its working-point cut.
+
+    The discriminant branch (what to cut on) comes from the ``btagging``
+    parameters, while the cut value is read directly from the BTV correctionlib
+    JSON via :func:`get_btag_wp_score`, so it always matches the tagger and
+    campaign used for the shape SF.
+
+    Args:
+        params: PocketCoffea parameters (``btagging`` and ``jet_scale_factors``).
+        year: data-taking year key used to index the parameters.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``); default loose.
+        tagger: b-tag discriminant branch. When ``None`` it is taken from
+            ``btagging.working_point.<year>.btagging_algorithm``.
+
+    Returns:
+        tuple(str, float): the tagger branch and its WP cut value.
+    """
+    wp_params = params["btagging"]["working_point"][year]
+    if tagger is None:
+        tagger = wp_params["btagging_algorithm"]
+    return tagger, get_btag_wp_score(params, year, wp, tagger)
+
+
+def _resolve_btag_threshold(
+    params, year, btag_algorithm=None, btag_wp=None, btag_score=None
+):
+    """Resolve the ``(tagger, threshold)`` to cut on.
+
+    Args:
+        params: PocketCoffea parameters (with the ``btagging`` section).
+        year: data-taking year key.
+        btag_algorithm: discriminant branch; defaults to the tagger in params.
+        btag_wp: working-point name; defaults to loose ``"L"``.
+        btag_score: raw threshold value, mutually exclusive with ``btag_wp``.
+
+    Returns:
+        tuple(str, float): the tagger branch and the numeric threshold.
+    """
+    if btag_score is not None:
+        if btag_wp is not None:
+            raise ValueError("Pass only one of `btag_wp` or `btag_score`.")
+        tagger = btag_algorithm
+        if tagger is None:
+            tagger = params["btagging"]["working_point"][year]["btagging_algorithm"]
+        return tagger, btag_score
+    return get_btag_working_point(params, year, btag_wp or "L", btag_algorithm)
+
+
+def _first_valid_jets(collections):
+    """Reduce a fallback chain to one collection, per jet.
+
+    Args:
+        collections: a single jet collection, or an ordered list of them. For
+            each jet the first collection with a valid pT (``pt > 0``) is kept;
+            the last collection is used as the unconditional fallback.
+
+    Returns:
+        The resolved jet collection.
+    """
+    if not isinstance(collections, (list, tuple)):
+        return collections
+    collections = list(collections)
+    result = collections[-1]
+    for jets in reversed(collections[:-1]):
+        result = ak.where(ak.nan_to_num(jets.pt, nan=-1) > 0, jets, result)
+    return result
+
+
+def merge_regressed_jets(
+    jets_high_btag,
+    jets_low_btag=None,
+    params=None,
+    year=None,
+    btag_algorithm=None,
+    btag_wp=None,
+    btag_score=None,
+):
+    """Merge pT-regressed jet collections choosing, per jet, on a b-tag cut.
+
+    Jets with a b-tag discriminant ``>=`` the threshold take ``jets_high_btag``,
+    the others take ``jets_low_btag``. Taking whole collections (not just pT)
+    keeps every pT-dependent field (pt, mass, systematic variations) consistent
+    within a jet.
+
+    Args:
+        jets_high_btag: collection, or ordered fallback chain, for jets passing
+            the b-tag cut. In a chain the first collection with a valid
+            regression (``pt > 0``) is used per jet and the last one is the
+            unconditional fallback (typically the standard JEC-only jets).
+        jets_low_btag: same, for jets failing the cut. If ``None`` no cut is
+            applied and all jets use ``jets_high_btag``.
+        params: PocketCoffea parameters (needed only when a cut is applied).
+        year: data-taking year key (needed only when a cut is applied).
+        btag_algorithm: discriminant branch to cut on (e.g. ``"btagPNetB"``);
+            defaults to the tagger in the b-tagging parameters.
+        btag_wp: working-point name used as threshold; defaults to loose ``"L"``.
+        btag_score: raw threshold value, mutually exclusive with ``btag_wp``.
+
+    Returns:
+        The merged jet collection.
+
+    Examples::
+
+        # use the regression where valid, else the standard jets
+        merge_regressed_jets([jets_reg, jets_std])
+        # as above, but high b-tag jets always use the regression (loose WP)
+        merge_regressed_jets(jets_reg, [jets_reg, jets_std], params, year)
+        # +neutrino regression for high b-tag jets, plain for the rest, medium WP
+        merge_regressed_jets([jets_nu, jets_noNu, jets_std], [jets_noNu, jets_std],
+                             params, year, btag_algorithm="btagPNetB", btag_wp="M")
+    """
+    high = _first_valid_jets(jets_high_btag)
+    if jets_low_btag is None:
+        return high
+    low = _first_valid_jets(jets_low_btag)
+
+    tagger, threshold = _resolve_btag_threshold(
+        params, year, btag_algorithm, btag_wp, btag_score
+    )
+    # the b-tag score is unchanged by the regression -> read it from any candidate
+    ref_jets = (
+        jets_high_btag[0]
+        if isinstance(jets_high_btag, (list, tuple))
+        else jets_high_btag
+    )
+    return ak.where(ref_jets[tagger] >= threshold, high, low)
 
 
 def CvsLsorted(jets,temp=None):    
@@ -285,6 +635,10 @@ def ProbBsorted(jets,temp=None):
         raise NotImplementedError(f"Using the tagger name while calling `ProbBsorted` is deprecated. Please use `jet_tagger={temp}` as an argument to `jet_selection`.")
     return jets[ak.argsort(jets["btagB"], axis=1, ascending=False)]
 
+def CCsorted(fatjets,temp=None):    
+    if temp is not None:
+        raise NotImplementedError(f"Using the tagger name while calling `CCsorted` is deprecated. Please use `jet_tagger={temp}` as an argument to `jet_selection`.")
+    return fatjets[ak.argsort(fatjets["btagCC"], axis=1, ascending=False)]
 
 def get_dijet(jets, taggerVars=True, remnant_jet = False):
     if isinstance(taggerVars,str):
@@ -358,87 +712,93 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         return dijet, remnant
 
 
-def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag):
+# JER smearing node, identical to jer_smear.json of the JERC application tutorial
+# (https://gitlab.cern.ch/cms-analysis/jme/jerc-application-tutorial).
+# GenPt selects the method: GenPt < 0 (bin [-1, 0)) -> stochastic smearing with a hashprng
+# random number; GenPt >= 0 (bin [0, 1), clamped above) -> scaling with the matched gen pt.
+# Therefore "no match" MUST be encoded as GenPt = -1: GenPt = 0 selects the scaling
+# formula and returns 1 + (sf - 1) * (pt - 0) / pt = sf.
+JERSMEAR_SCHEMA = {
+    "name": "JERSmear",
+    "description": "Jet smearing tool",
+    "inputs": [
+        {"name": "JetPt", "type": "real"},
+        {"name": "JetEta", "type": "real"},
+        {
+            "name": "GenPt",
+            "type": "real",
+            "description": "matched GenJet pt, or -1 if no match",
+        },
+        {"name": "Rho", "type": "real", "description": "entropy source"},
+        {"name": "EventID", "type": "int", "description": "entropy source"},
+        {
+            "name": "JER",
+            "type": "real",
+            "description": "Jet energy resolution",
+        },
+        {
+            "name": "JERsf",
+            "type": "real",
+            "description": "Jet energy resolution scale factor",
+        },
+    ],
+    "output": {"name": "smear", "type": "real"},
+    "version": 1,
+    "data": {
+        "nodetype": "binning",
+        "input": "GenPt",
+        "edges": [-1, 0, 1],
+        "flow": "clamp",
+        "content": [
+            # stochastic
+            {
+                # rewrite gen_pt with a random gaussian
+                "nodetype": "transform",
+                "input": "GenPt",
+                "rule": {
+                    "nodetype": "hashprng",
+                    "inputs": ["JetPt", "JetEta", "Rho", "EventID"],
+                    "distribution": "normal",
+                },
+                "content": {
+                    "nodetype": "formula",
+                    # TODO min jet pt?
+                    "expression": "1+sqrt(max(x*x - 1, 0)) * y * z",
+                    "parser": "TFormula",
+                    # now gen_pt is actually the output of hashprng
+                    "variables": ["JERsf", "JER", "GenPt"],
+                },
+            },
+            # deterministic
+            {
+                "nodetype": "formula",
+                # TODO min jet pt?
+                "expression": "1+(x-1)*(y-z)/y",
+                "parser": "TFormula",
+                "variables": ["JERsf", "JetPt", "GenPt"],
+            },
+        ],
+    },
+}
+
+
+@functools.lru_cache(maxsize=None)
+def get_jer_correction_set(jer_json, jer_tags):
     # learned from: https://github.com/cms-nanoAOD/correctionlib/issues/130
+    # Cached per process by (jer_json, jer_tags): the JSON is parsed and the JERSmear
+    # evaluator built once. jer_tags is a tuple (hashable). The parsed schema is filtered
+    # in place, but that happens on this local object; the returned evaluator is read-only,
+    # so caching it does not share the mutated schema with any other consumer.
     with gzip.open(jer_json) as fin:
         cset = CorrectionSet.parse_raw(fin.read())
-
     cset.corrections = [
         c
         for c in cset.corrections
         if c.name
-        in (
-            jer_ptres_tag,
-            jer_sf_tag,
-        )
+        in jer_tags
     ]
     cset.compound_corrections = []
-
-    res = Correction.parse_obj(
-        {
-            "name": "JERSmear",
-            "description": "Jet smearing tool",
-            "inputs": [
-                {"name": "JetPt", "type": "real"},
-                {"name": "JetEta", "type": "real"},
-                {
-                    "name": "GenPt",
-                    "type": "real",
-                    "description": "matched GenJet pt, or -1 if no match",
-                },
-                {"name": "Rho", "type": "real", "description": "entropy source"},
-                {"name": "EventID", "type": "int", "description": "entropy source"},
-                {
-                    "name": "JER",
-                    "type": "real",
-                    "description": "Jet energy resolution",
-                },
-                {
-                    "name": "JERsf",
-                    "type": "real",
-                    "description": "Jet energy resolution scale factor",
-                },
-            ],
-            "output": {"name": "smear", "type": "real"},
-            "version": 1,
-            "data": {
-                "nodetype": "binning",
-                "input": "GenPt",
-                "edges": [-1, 0, 1],
-                "flow": "clamp",
-                "content": [
-                    # stochastic
-                    {
-                        # rewrite gen_pt with a random gaussian
-                        "nodetype": "transform",
-                        "input": "GenPt",
-                        "rule": {
-                            "nodetype": "hashprng",
-                            "inputs": ["JetPt", "JetEta", "Rho", "EventID"],
-                            "distribution": "normal",
-                        },
-                        "content": {
-                            "nodetype": "formula",
-                            # TODO min jet pt?
-                            "expression": "1+sqrt(max(x*x - 1, 0)) * y * z",
-                            "parser": "TFormula",
-                            # now gen_pt is actually the output of hashprng
-                            "variables": ["JERsf", "JER", "GenPt"],
-                        },
-                    },
-                    # deterministic
-                    {
-                        "nodetype": "formula",
-                        # TODO min jet pt?
-                        "expression": "1+(x-1)*(y-z)/y",
-                        "parser": "TFormula",
-                        "variables": ["JERsf", "JetPt", "GenPt"],
-                    },
-                ],
-            },
-        }
-    )
-    cset.corrections.append(res)
+    cset.corrections.append(Correction.parse_obj(JERSMEAR_SCHEMA))
     ceval = cset.to_evaluator()
     return ceval
 
@@ -458,6 +818,37 @@ def safe_jersmear(smear):
     return np.where(np.isfinite(smear) & (smear > 0), smear, 1.0)
 
 
+def get_jersmear_SFunc(_eval_dict, _ceval, _jer_sf_tag, syst_tag=None):
+    # Getting JER SFs
+    _inputs_jer_sf = [_eval_dict[input.name] for input in _ceval[_jer_sf_tag].inputs]
+    _jer_sf = _ceval[_jer_sf_tag].evaluate(*_inputs_jer_sf)
+    _eval_dict.update({"JERsf": _jer_sf})
+
+    # Applying the smearing using the SFs (nominal)
+    _inputs = [_eval_dict[input.name] for input in _ceval["JERSmear"].inputs]
+    _jersmear = _ceval["JERSmear"].evaluate(*_inputs)
+
+    if not syst_tag:
+        return _jersmear
+    
+    # Getting SFuncertainties
+    _inputs_jer_syst = [_eval_dict[input.name] for input in _ceval[syst_tag].inputs]
+    _sf_unc = _ceval[syst_tag].evaluate(*_inputs_jer_syst)
+
+    # Calculating up shift 
+    SF_up = _jer_sf * (1 + _sf_unc)
+    _eval_dict.update({"JERsf": SF_up})
+    _inputs = [_eval_dict[input.name] for input in _ceval["JERSmear"].inputs]
+    _jersmear_up = _ceval["JERSmear"].evaluate(*_inputs)
+
+    # Calculating down shift 
+    SF_down = _jer_sf * (1 - _sf_unc)
+    _eval_dict.update({"JERsf": SF_down})
+    _inputs = [_eval_dict[input.name] for input in _ceval["JERSmear"].inputs]
+    _jersmear_down = _ceval["JERSmear"].evaluate(*_inputs)
+
+    return _jersmear, _jersmear_up, _jersmear_down
+
 def jet_correction_corrlib(
     calib_params,
     variations,
@@ -465,9 +856,10 @@ def jet_correction_corrlib(
     jet_type,
     jet_coll_name,
     chunk_metadata,
+    nano_version,
     apply_jer=True,
     jec_syst=True,
-):
+):    
     isMC = chunk_metadata["isMC"]
     year = chunk_metadata["year"]
     era = chunk_metadata["era"]
@@ -496,31 +888,35 @@ def jet_correction_corrlib(
     else:
         apply_jer = False
 
+    if jer_syst and not apply_jer: 
+        raise Exception(
+            f"JER systematics can only be applied, "
+            "if nominal JER shifts are applied aswell, "
+            "which is turned off for collection {jet_coll_name}")
+
     tag_jec = "_".join([jec_tag, level, jet_type])
 
     # get the correction sets
-    cset = correctionlib.CorrectionSet.from_file(json_path)
+    cset = load_correction_set(json_path)
 
     # prepare inputs
     # no need of copies
     jets_jagged = events[jet_coll_name]
     counts = ak.num(jets_jagged)
 
-    if ("event_id" not in jets_jagged.fields) and (apply_jer or jer_syst):
-        jets_jagged["event_id"] = ak.ones_like(jets_jagged.pt) * events.event
-    if ("run_nr" not in jets_jagged.fields):
-        jets_jagged["run_nr"] = ak.ones_like(jets_jagged.pt) * events.run
-    if year in ['2016_PreVFP', '2016_PostVFP','2017','2018']:
-        rho = events.fixedGridRhoFastjetAll
-    else:
-        rho = events.Rho.fixedGridRhoFastjetAll
+    nano_version = chunk_metadata.get("nano_version", 9)
+    rho = get_rho(events, nano_version)
     # Add variables needed for JEC and JER corrections (e.g. pt_raw, mass_raw, pt_gen, event_rho).
     # JME gen matching for the JER: dR < R/2 on top of the NanoAOD genJetIdx match; -1 = no match.
     cone = 0.8 if jet_type.startswith("AK8") else 0.4
     jets_jagged = add_jec_variables(jets_jagged, rho, isMC, gen_match_dr=cone / 2, nomatch_value=-1.0)
 
+    if ("event_id" not in jets_jagged.fields) and (apply_jer or jer_syst):
+        jets_jagged["event_id"] = ak.ones_like(jets_jagged.pt) * events.event
+    if ("run_nr" not in jets_jagged.fields):
+        jets_jagged["run_nr"] = ak.ones_like(jets_jagged.pt) * events.run
+    
     # flatten
-
     jets = ak.flatten(jets_jagged)
     # evaluate dictionary
     eval_dict = {
@@ -540,7 +936,8 @@ def jet_correction_corrlib(
         elif tag_jec in list(cset.keys()):
             sf = cset[tag_jec]
         else:
-            print(tag_jec, list(cset.keys()), list(cset.compound.keys()))
+            print("CONFIG ERROR: No JEC correction!")
+            print("Tag=",tag_jec, "\n cset keys:", list(cset.keys()), "\n compound keys:", list(cset.compound.keys()))
             raise Exception(f"[No JEC correction: {tag_jec} - Year: {year} - Era: {era} - Level: {level}")
         inputs = [eval_dict[input.name] for input in sf.inputs]
         sf_value = sf.evaluate(*inputs)
@@ -559,7 +956,9 @@ def jet_correction_corrlib(
         jer_ptres_tag = f"{jer_tag}_PtResolution_{jet_type}"
         jer_sf_tag = f"{jer_tag}_ScaleFactor_{jet_type}"
 
-        ceval_jer = get_jer_correction_set(json_path, jer_ptres_tag, jer_sf_tag)
+        jer_sfunc_tag = jer_sf_tag.replace("ScaleFactor", "SFUncertainty")
+        ceval_jer = get_jer_correction_set(json_path, (jer_ptres_tag, jer_sf_tag, jer_sfunc_tag))
+
         # update evaluate dictionary
         eval_dict.update(
             {
@@ -588,23 +987,25 @@ def jet_correction_corrlib(
             }
         )
         if apply_jer:
-            eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "nom")
-            jersmear = safe_jersmear(jersmear)
-            jets["pt_jer"] = jets.pt * jersmear
-            jets["mass_jer"] = jets.mass * jersmear
-        if jer_syst:
-            # jer up
-            eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "up")
-            jersmear = safe_jersmear(jersmear)
-            jets["pt_JER_up"] = jets.pt * jersmear
-            jets["mass_JER_up"] = jets.mass * jersmear
-            # jer down
-            eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "down")
-            jersmear = safe_jersmear(jersmear)
-            jets["pt_JER_down"] = jets.pt * jersmear
-            jets["mass_JER_down"] = jets.mass * jersmear
-        if apply_jer:
+            if jer_syst:
+                jersmear, jersmear_up, jersmear_down = map(
+                    safe_jersmear, get_jersmear_SFunc(eval_dict, ceval_jer, jer_sf_tag, syst_tag=jer_sfunc_tag))
+                # jer nominal
+                jets["pt_jer"] = jets.pt * jersmear
+                jets["mass_jer"] = jets.mass * jersmear
+                # jer up
+                jets["pt_JER_up"] = jets.pt * jersmear_up
+                jets["mass_JER_up"] = jets.mass * jersmear_up
+                # jer down
+                jets["pt_JER_down"] = jets.pt * jersmear_down
+                jets["mass_JER_down"] = jets.mass * jersmear_down
+            else:
+                jersmear = safe_jersmear(get_jersmear_SFunc(eval_dict, ceval_jer, jer_sf_tag))
+                jets["pt_jer"] = jets.pt * jersmear
+                jets["mass_jer"] = jets.mass * jersmear
+            
             # to avoid the sf: jer*jer_up or jer*jer_down, update the jer pt/mass after calculation of the jer up/down
+            # store the nominal smearing factor so analyses can undo it per jet
             jets["pt_sf_jer"] = ak.where(
                     jets.pt != 0,
                     jets["pt_jer"]/jets["pt"],
@@ -658,6 +1059,7 @@ def msoftdrop_correction(
     subjet_type,
     jet_coll_name,
     chunk_metadata,
+    nano_version,
     jec_syst=True,
 ):
     """Apply softdrop mass correction to large-radius jets (FatJet) using correctionlib.
@@ -692,7 +1094,7 @@ def msoftdrop_correction(
     tag_jec = "_".join([jec_tag, level, subjet_type])
 
     # get the correction sets
-    cset = correctionlib.CorrectionSet.from_file(json_path)
+    cset = load_correction_set(json_path)
 
     # prepare inputs
     jets_jagged = events[jet_coll_name]
@@ -702,11 +1104,9 @@ def msoftdrop_correction(
     jets_jagged["event_id"] = ak.ones_like(jets_jagged.pt) * events.event
     jets_jagged["run_nr"] = ak.ones_like(jets_jagged.pt) * events.run
 
-    if year in ['2016_PreVFP', '2016_PostVFP','2017','2018']:
-        rho = events.fixedGridRhoFastjetAll
-    else:
-        rho = events.Rho.fixedGridRhoFastjetAll
-    
+    nano_version = chunk_metadata.get("nano_version", 9)
+    rho = get_rho(events, nano_version)
+
     jets_jagged["rho"] = ak.ones_like(jets_jagged.pt) * rho
 
     # Early return if no jets in any event
@@ -893,3 +1293,27 @@ def msoftdrop_correction(
     #            jets_jagged[f"msoftdrop_JES_{jes_vari}_{shift}"] = new_msoftdrop
 
     return jets_jagged
+
+
+# Name of the field the JetsCalibrator writes on the jet collection to record the
+# permutation applied when it re-sorts the jets by corrected pt.
+JET_SORTIDX_FIELD = "pocket_sortidx"
+
+
+def jets_in_original_order(jets, sortidx_field=JET_SORTIDX_FIELD):
+    '''Return the jet collection in its original (NanoAOD) order.
+
+    The ``JetsCalibrator`` re-sorts the jet collection by the corrected pt (for both the
+    nominal and the systematic variations) and records the applied permutation as the
+    ``sortidx_field`` field of the collection. Per-jet indices carried by other
+    collections (e.g. ``Electron.jetIdx`` / ``Muon.jetIdx``) point into the *original*
+    NanoAOD order, so consumers that look a jet up by such an index must first undo the
+    re-sorting. Applying ``argsort`` to the stored permutation inverts it and restores the
+    original order.
+
+    If the field is absent (no calibrator re-sorting was applied, e.g. sorting disabled or
+    a collection the calibrator did not touch) the jets are returned unchanged.
+    '''
+    if sortidx_field in jets.fields:
+        return jets[ak.argsort(jets[sortidx_field], axis=1)]
+    return jets

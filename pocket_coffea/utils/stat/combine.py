@@ -1,6 +1,7 @@
 """Datacard Class and Utilities for CMS Combine Tool"""
 
 import os
+import warnings
 from functools import cached_property
 
 import hist
@@ -17,6 +18,17 @@ AUTO_MC_STATS = {
     "include_signal": 0,
     "hist_mode": 1,
 }
+
+
+def format_rate(value, sig=6):
+    """Format a datacard rate preserving its magnitude.
+
+    The previous implementation sliced the plain float repr to a fixed width
+    (`f"{rate}"[:10]`), which silently dropped the exponent of small rates
+    (e.g. 3.4567890123e-05 -> "3.45678901", inflating the rate by 1e5). A
+    significant-figure format keeps the exponent and stays compact.
+    """
+    return f"{value:.{sig}g}"
 
 
 class Datacard:
@@ -65,8 +77,32 @@ class Datacard:
         bin_prefix: str = None,
         bin_suffix: str = None,
         verbose: bool = True,
+        shape_only_for_rateparam: bool = False,
+        rateparam_norm_categories: list[str] = None,
+        rateparam_norm_histograms: dict[str, dict[str, hist.Hist]] = None,
+        data_variations: dict[str, str] = None,
     ) -> None:
-        """Initialize the Datacard."""
+        """Initialize the Datacard.
+
+        :param shape_only_for_rateparam: If True, shape systematics on processes with a
+            free rateParam (``MCProcess.has_rateParam``) are made shape-only: each Up/Down
+            template is rescaled so the process total yield matches its nominal, removing
+            the overall-normalization component that the rateParam already absorbs while
+            preserving the bin-to-bin shape and the event migration between regions.
+        :type shape_only_for_rateparam: bool, optional
+        :param rateparam_norm_categories: Categories (fit regions) the rateParam spans, over
+            which the preserved total is summed. Defaults to every category present on the
+            input histogram axis. Pass the explicit list of fit categories when the coffea
+            output contains categories that are not part of the combined datacard.
+        :type rateparam_norm_categories: list[str], optional
+        :param rateparam_norm_histograms: Histograms (``{sample: {dataset: hist}}``) of any
+            variable filled in every ``rateparam_norm_categories`` category, used only for the
+            flow-inclusive totals of the shape-only factor. Defaults to the card's own
+            ``histograms``; pass it when the card's variable is restricted with
+            ``only_categories`` and so lacks some norm categories. Never rebinned (the totals
+            include the flow bins, so the binning is irrelevant).
+        :type rateparam_norm_histograms: dict[str, dict[str, hist.Hist]], optional
+        """
 
         self.histograms = histograms
         self.datasets_metadata = datasets_metadata
@@ -81,6 +117,11 @@ class Datacard:
         self.bin_prefix = bin_prefix
         self.bin_suffix = bin_suffix
         self.verbose = verbose
+        self.shape_only_for_rateparam = shape_only_for_rateparam
+        self.rateparam_norm_categories = rateparam_norm_categories
+        self.rateparam_norm_histograms = rateparam_norm_histograms
+        self.data_variations = data_variations
+        self.rateparam_shape_scale = {}
         if self.bin_suffix is None:
             self.bin_suffix = "_".join(self.years)
         self.number_width = 10
@@ -115,9 +156,13 @@ class Datacard:
         self._check_histograms()
         self.histogram = self.rearrange_histograms(is_data=False)
 
+        #if self.has_data:
+        #    self.data_obs = self.rearrange_histograms(is_data=True)
         if self.has_data:
-            self.data_obs = self.rearrange_histograms(is_data=True)
-
+            self.data_obs = self.rearrange_histograms(
+                is_data=True,
+                data_variations=self.data_variations,
+            )
         self._check_shapes()
 
         # helper attributes
@@ -195,10 +240,18 @@ class Datacard:
             return -1
 
     def rate(self, process: str, systematic="nominal") -> float:
-        """Rate of a process in the datacard"""
-        # TODO: fix histograms (e.g. negative bins)!
+        """Rate of a process in the datacard.
 
-        return self.histogram[process, systematic, :].sum()["value"]
+        Negative bins are clipped to zero before the shape template is written
+        to ROOT (Combine cannot handle negative bin contents, see
+        ``_clip_negative_bins``). The rate reported here must match the integral
+        of that written template, otherwise Combine would rescale the clipped
+        shape to a rate that no longer equals its integral. So we apply the same
+        clipping before summing (in-range bins only, consistent with how both
+        ``.sum()`` and ``_clip_negative_bins`` treat the flow bins).
+        """
+        values = self.histogram[process, systematic, :].values()
+        return float(_clip_negative(values).sum())
 
     @property
     def imax(self):
@@ -282,12 +335,15 @@ class Datacard:
 
     def _check_histograms(self) -> None:
         """Check if histograms are available for all processes and systematics."""
-        available_variations = []
-        for systematic in self.systematics.get_systematics_by_type("shape"):
-            for shift in ("Up", "Down"):
-                available_variations.append(f"{systematic}{shift}")
+        shape_systematics = self.systematics.get_systematics_by_type("shape").values()
 
         for process in self.mc_processes.values():
+            available_variations = []
+            if not process.is_data:
+                for systematic in shape_systematics:
+                    coffea_name = systematic.get_coffea_name(process.name)
+                    for shift in ("Up", "Down"):
+                        available_variations.append(f"{coffea_name}{shift}")
             for sample in process.samples:
                 if sample not in self.histograms:
                     raise ValueError(f"Missing histogram for sample {sample}")
@@ -319,7 +375,8 @@ class Datacard:
 
     def _check_shapes(self, threshold: float = 1.0, raise_error: bool = False) -> None:
         """Sanity checks for saved shapes.
-        If each variation differs by more than 100% from the nominal, an error is raised."""
+        If each variation differs by more than 100% from the nominal, an error is raised.
+        """
         # Loop over variations in self.histogram as saved after rearranging
         for process in self.mc_processes.values():
             for year in process.years:
@@ -354,37 +411,57 @@ class Datacard:
     def rearrange_histograms(
         self,
         is_data: bool = False,
+        category: str = None,
+        histograms: dict[str, dict[str, hist.Hist]] = None,
+        data_variations: dict[str, str] | None = None,
     ) -> hist.Hist:
         """Rearrange histograms from pocket_coffea output format to match processes
         and systematics in one histogram.
 
+        The under/overflow content of the variable axis is preserved (copied with
+        ``flow=True``), so flow-inclusive sums of the rearranged histogram equal the
+        input category totals even when rebinning to a sub-range moved content into
+        the flow bins. This is what makes the shape-only rateParam factors of
+        :meth:`compute_rateparam_shape_scales` observable-independent and identical
+        across the per-category datacards. Written templates and rates still use
+        in-range bins only.
+
         :param is_data: Flag to indicate if the datacard is for data, defaults to False
         :type is_data: bool, optional
+        :param category: Category to select; defaults to ``self.category``. Allows building
+            the rearranged single-category histogram for any region from the same input.
+        :type category: str, optional
+        :param histograms: Input histograms to rearrange; defaults to ``self.histograms``.
+        :type histograms: dict[str, dict[str, hist.Hist]], optional
         :return: Rearranged histogram
         :rtype: hist.Hist
         """
+        cat = category if category is not None else self.category
+        hs = histograms if histograms is not None else self.histograms
         if is_data:
             processes = self.data_processes
         else:
             processes = self.mc_processes
         assert (
             (not is_data) & all(not process.is_data for process in processes.values())
-        ) or (is_data & all(process.is_data for process in processes.values())), (
-            "All processes must be either data or MC"
-        )
+        ) or (
+            is_data & all(process.is_data for process in processes.values())
+        ), "All processes must be either data or MC"
 
         # Extract variable axis from the first dataset
         sample = list(processes.values())[0].samples[0]
         datasets = list(self.get_datasets_by_sample(sample))
         for dataset in datasets:
-            if not dataset in self.histograms[sample]:
+            if not dataset in hs[sample]:
                 continue
             else:
-                variable_axis = self.histograms[sample][dataset].axes[-1]
+                variable_axis = hs[sample][dataset].axes[-1]
                 break
 
         if is_data:
-            processes_names = ["data_obs"]  # For data, we use a single process name without year
+            processes_names = [
+                "data_obs"
+            ]  # For data, we use a single process name without year
             new_histogram = hist.Hist(
                 hist.axis.StrCategory(processes_names, name="process"),
                 variable_axis,
@@ -402,7 +479,10 @@ class Datacard:
                 variable_axis,
                 storage=hist.storage.Weight(),
             )
-        new_histogram_view = new_histogram.view()
+        # flow=True view: keep the variable-axis under/overflow (see docstring).
+        # Categorical axes append their overflow slot at the end, so the integer
+        # process/variation indices used below are unaffected.
+        new_histogram_view = new_histogram.view(flow=True)
 
         for process in processes.values():
             for sample in process.samples:
@@ -412,21 +492,39 @@ class Datacard:
                     for dataset in self.get_datasets_by_sample(sample, year):
                         if self.is_empty_dataset(dataset):
                             continue
-                        histogram = self.histograms[sample][dataset]
+                        histogram = hs[sample][dataset]
                         if is_data:
                             process_index = new_histogram.axes["process"].index("data_obs")
-                            new_histogram_view[process_index, :] += histogram[
-                                self.category, :
-                            ].view()
+                            if "variation" in histogram.axes.name:
+                                variation = (
+                                    data_variations.get(sample, "nominal")
+                                    if data_variations is not None
+                                    else "nominal")
+                                if variation not in histogram.axes["variation"]:
+                                    raise ValueError(
+                                        f"Requested data variation {variation!r} for sample "
+                                        f"{sample!r}, dataset {dataset}, but available variations are "
+                                        f"{list(histogram.axes['variation'])}"
+                                    )
+                                new_histogram_view[process_index, :] += histogram[
+                                    cat, variation, :
+                                ].view(flow=True)
+
+                            else:
+                                new_histogram_view[process_index, :] += histogram[
+                                    cat, :
+                                ].view(flow=True)
                         else:
-                            process_index = new_histogram.axes["process"].index(f"{process.name}_{year}")
+                            process_index = new_histogram.axes["process"].index(
+                                f"{process.name}_{year}"
+                            )
                             # Save nominal variation
                             variation_index_nominal = new_histogram.axes[
                                 "variation"
                             ].index("nominal")
                             new_histogram_view[
                                 process_index, variation_index_nominal, :
-                            ] += histogram[self.category, "nominal", :].view()
+                            ] += histogram[cat, "nominal", :].view(flow=True)
                             for (
                                 syst_name,
                                 systematic,
@@ -434,26 +532,110 @@ class Datacard:
                                 "shape"
                             ).items():
                                 for shift in ("Up", "Down"):
-                                    variation = f"{syst_name}{shift}"
+                                    source_variation = f"{systematic.get_coffea_name(process.name)}{shift}"
                                     variation_index = new_histogram.axes[
                                         "variation"
                                     ].index(f"{systematic.datacard_name}{shift}")
-                                    if variation in histogram.axes["variation"]:
+                                    if source_variation in histogram.axes["variation"]:
                                         new_histogram_view[
                                             process_index, variation_index, :
                                         ] += histogram[
-                                            self.category, variation, :
-                                        ].view()
+                                            cat, source_variation, :
+                                        ].view(flow=True)
                                     else:
                                         print(
-                                            f"Setting `{variation}` variation to nominal variation for sample {sample}."
+                                            f"Setting `{source_variation}` variation to nominal variation for sample {sample}."
                                         )
                                         new_histogram_view[
                                             process_index, variation_index, :
-                                        ] += histogram[
-                                            self.category, "nominal", :
-                                        ].view()
+                                        ] += histogram[cat, "nominal", :].view(flow=True)
+            if is_data:
+                if not np.all(
+                    np.mod(new_histogram.values(), 1) == 0
+                ):
+                    if process.round_counts:
+                        new_histogram_view["value"] = np.round(
+                            new_histogram_view["value"]
+                        )
         return new_histogram
+
+    def _all_input_categories(
+        self, histograms: dict[str, dict[str, hist.Hist]] = None
+    ) -> list[str]:
+        """List the category labels available on the input histograms' category axis."""
+        hs = histograms if histograms is not None else self.histograms
+        for process in self.mc_processes.values():
+            for sample in process.samples:
+                for dataset in self.get_datasets_by_sample(sample):
+                    if dataset in hs.get(sample, {}):
+                        return list(hs[sample][dataset].axes[0])
+        raise RuntimeError("No input histogram found to read the category axis from.")
+
+    def compute_rateparam_shape_scales(self) -> dict:
+        """Compute shape-only rescaling factors for processes with a free rateParam.
+
+        For each (rateParam process, shape systematic, shift) the factor is
+        ``Σ nominal / Σ varied``, summed with flow over all ``rateparam_norm_categories``
+        and over the process years where the systematic applies. Applying it to every
+        Up/Down template holds the process total fixed (the normalization the rateParam
+        already absorbs) while preserving the bin-to-bin shape and the region/year
+        migration. The totals are observable-independent because
+        :meth:`rearrange_histograms` preserves the variable-axis flow content and the
+        sums here include it: even when a card's variable is rebinned to a sub-range,
+        the out-of-range content still counts. Every per-category Datacard therefore
+        derives the same factors, provided the histograms used for the totals (the
+        card's own, or ``rateparam_norm_histograms``) are filled in every norm category.
+
+        :return: mapping ``(process_name, systematic.datacard_name, shift) -> float``
+        :rtype: dict
+        """
+        rateparam_processes = [p for p in self.mc_processes.values() if p.has_rateParam]
+        if not rateparam_processes:
+            return {}
+
+        norm_hists = self.rateparam_norm_histograms or self.histograms
+        available = self._all_input_categories(norm_hists)
+        cats = self.rateparam_norm_categories or available
+        missing = set(cats) - set(available)
+        if missing:
+            raise ValueError(
+                f"rateparam_norm_categories {sorted(missing)} are not on the category axis "
+                "of the histograms used for the shape-only totals. Pass "
+                "`rateparam_norm_histograms=` with a variable filled in every norm category "
+                "(e.g. a jet-multiplicity histogram)."
+            )
+        hists_by_cat = {
+            cat: self.rearrange_histograms(
+                is_data=False, category=cat, histograms=norm_hists
+            )
+            for cat in cats
+        }
+
+        shape_systs = self.systematics.get_systematics_by_type("shape")
+        scales = {}
+        for process in rateparam_processes:
+            for systematic in shape_systs.values():
+                for shift in ("Up", "Down"):
+                    variation = f"{systematic.datacard_name}{shift}"
+                    nom_sum = 0.0
+                    var_sum = 0.0
+                    for year in process.years:
+                        if not (
+                            process.name in systematic.processes
+                            and year in systematic.years
+                        ):
+                            continue
+                        proc_year = f"{process.name}_{year}"
+                        for h in hists_by_cat.values():
+                            nom_sum += (
+                                h[proc_year, "nominal", :].values(flow=True).sum()
+                            )
+                            var_sum += (
+                                h[proc_year, variation, :].values(flow=True).sum()
+                            )
+                    scale = nom_sum / var_sum if var_sum > 0 else 1.0
+                    scales[(process.name, systematic.datacard_name, shift)] = scale
+        return scales
 
     def create_shape_histogram_dict(
         self, is_data: bool = False
@@ -483,6 +665,19 @@ class Datacard:
                     )
                     new_histogram_view = new_histogram.view()
                     new_histogram_view[:] = histogram[process_name_byyear, :].view()
+                    if not np.all(
+                        np.mod(new_histogram.values(), 1) == 0
+                    ):
+                        if process.round_counts:
+                            new_histogram_view["value"] = np.round(
+                                new_histogram_view["value"]
+                            )
+                            # Set the variance to the value itself (so the uncertainty is sqrt(N))
+                            new_histogram_view["variance"] = new_histogram_view["value"]
+                        else:
+                            warnings.warn(
+                                f"Data histogram for process '{process_name_byyear}' has non-integer bin values, but it should represent event counts."
+                            )
                     new_histograms[f"{process_name_byyear}_nominal"] = new_histogram
                 else:
                     process_name_byyear = f"{process.name}_{year}"
@@ -519,6 +714,23 @@ class Datacard:
                                 new_histogram_view[:] = histogram[
                                     process_name_byyear, variation, :
                                 ].view()
+                                # shape-only: strip the normalization absorbed by the
+                                # rateParam, keeping shape and inter-region migration
+                                if (
+                                    self.shape_only_for_rateparam
+                                    and process.has_rateParam
+                                ):
+                                    scale = self.rateparam_shape_scale.get(
+                                        (
+                                            process.name,
+                                            systematic.datacard_name,
+                                            shift,
+                                        ),
+                                        1.0,
+                                    )
+                                    if scale != 1.0:
+                                        new_histogram_view["value"] *= scale
+                                        new_histogram_view["variance"] *= scale**2
                                 shape_name = f"{process_name_byyear}_{systematic.datacard_name}{shift}"
                                 new_histograms[shape_name] = new_histogram
 
@@ -568,7 +780,9 @@ class Datacard:
         # rates
         content += "rate".ljust(self.adjust_first_column)
         content += "".join(
-            f"{self.rate(f'{process.name}_{year}')}"[: self.number_width].ljust(self.adjust_columns)
+            format_rate(self.rate(f"{process.name}_{year}")).ljust(
+                self.adjust_columns
+            )
             for process in self.mc_processes.values()
             for year in process.years
             if not process.is_data
@@ -677,6 +891,9 @@ class Datacard:
 
         os.makedirs(directory, exist_ok=True)
 
+        if self.shape_only_for_rateparam and not self.rateparam_shape_scale:
+            self.rateparam_shape_scale = self.compute_rateparam_shape_scales()
+
         with open(card_file, "w") as card:
             card.write(self.content(shapes_filename=shapes_name))
 
@@ -686,9 +903,9 @@ class Datacard:
         with uproot.recreate(shapes_file) as root_file:
             if self.has_data:
                 for shape, histogram in shape_histograms_data.items():
-                    root_file[shape] = histogram
+                    root_file[shape] = _clip_negative_bins(histogram, shape)
             for shape, histogram in shape_histograms.items():
-                root_file[shape] = histogram
+                root_file[shape] = _clip_negative_bins(histogram, shape)
 
     def __repr__(self) -> str:
         """Return a string representation of the Datacard."""
@@ -740,9 +957,9 @@ class Datacard:
                     weighted_sum_flow = histogram.sum(flow=True)
                     weighted_sum = histogram.sum(flow=False)
                     weighted_sum_str = f"{weighted_sum} ({weighted_sum_flow} with flow)"
-                    simplified[sample][dataset] = (
-                        f"Hist(..., name={axis_name}, sum={weighted_sum_str})"
-                    )
+                    simplified[sample][
+                        dataset
+                    ] = f"Hist(..., name={axis_name}, sum={weighted_sum_str})"
             return simplified
 
         histogram_str = simplify_hist_dict(self.histograms)
@@ -758,6 +975,43 @@ class Datacard:
             f"{indent}mcstat={self.mcstat_config if self.mcstat else 'mcstat=False'}\n"
             ")"
         )
+
+
+def _clip_negative(values: np.ndarray) -> np.ndarray:
+    """Return a copy of ``values`` with negative entries set to zero.
+
+    Used by :meth:`Datacard.rate` so the declared rate matches the integral of
+    the template written to ROOT. It applies the same ``values < 0 -> 0`` rule
+    as :func:`_clip_negative_bins` (which zeroes the actual template bins and
+    their variances); keep the two in sync if that rule ever changes.
+    """
+    return np.where(values < 0, 0.0, values)
+
+
+def _clip_negative_bins(histogram: hist.Hist, shape_name: str) -> hist.Hist:
+    """Clip negative bin values (and their variances) to zero before writing to ROOT.
+
+    Combine cannot handle negative bin contents in shape templates. When any are
+    found, set them to zero and emit a warning identifying the affected shape.
+    """
+    view = histogram.view()
+    values = view["value"]
+    negative_mask = values < 0
+    if not np.any(negative_mask):
+        return histogram
+
+    n_neg = int(negative_mask.sum())
+    min_val = float(values[negative_mask].min())
+    warnings.warn(
+        f"Shape '{shape_name}' has {n_neg} bin(s) with negative content "
+        f"(min={min_val:.4g}); clipping to 0 before writing to ROOT.",
+        stacklevel=2,
+    )
+    clipped = histogram.copy()
+    clipped_view = clipped.view()
+    clipped_view["value"][negative_mask] = 0.0
+    clipped_view["variance"][negative_mask] = 0.0
+    return clipped
 
 
 def combine_datacards(
@@ -783,9 +1037,9 @@ def combine_datacards(
     :param channel_masks: Whether to add --channel-masks option to text2workspace.py.
     :type channel_masks: bool
     """
-    assert path.endswith(".sh"), (
-        "Output file must be a bash script and have .sh extension"
-    )
+    assert path.endswith(
+        ".sh"
+    ), "Output file must be a bash script and have .sh extension"
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, path)
 
