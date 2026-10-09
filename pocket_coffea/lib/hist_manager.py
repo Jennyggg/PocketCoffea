@@ -619,7 +619,7 @@ class HistManager:
                                 if histo.extra_weight is not None:
                                     _ew = ak.to_numpy(events[histo.extra_weight][mask])
                                     if data_structure is not None:
-                                        _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                                        _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure)[0]))
                                     _notnone = ak.to_numpy(all_axes_isnotnone)
                                     weight_varied = weight_varied[_notnone] * _ew[_notnone]
                                     try:
@@ -693,7 +693,7 @@ class HistManager:
                             if histo.extra_weight is not None:
                                 _ew = ak.to_numpy(events[histo.extra_weight][mask])
                                 if data_structure is not None:
-                                    _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                                    _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure)[0]))
                                 _notnone = ak.to_numpy(all_axes_isnotnone)
                                 weight_nom = weight_nom[_notnone] * _ew[_notnone]
                                 try:
@@ -750,7 +750,7 @@ class HistManager:
                         if histo.extra_weight is not None:
                             _ew = ak.to_numpy(events[histo.extra_weight][mask])
                             if data_structure is not None:
-                                _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure[mask])[0]))
+                                _ew = ak.to_numpy(ak.flatten(ak.broadcast_arrays(_ew, data_structure)[0]))
                             _notnone = ak.to_numpy(all_axes_isnotnone)
                             weight_data = weight_data[_notnone] * _ew[_notnone]
                             try:

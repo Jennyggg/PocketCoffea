@@ -8,15 +8,30 @@ from correctionlib.schemav2 import Correction, CorrectionSet
 from ..utils.utils import get_nano_version, replace_at_indices
 
 
-def add_jec_variables(jets, event_rho, isMC=True):
+def add_jec_variables(jets, event_rho, isMC=True, gen_match_dr=None, nomatch_value=0.0):
+    """Add the inputs of the JEC/JER evaluation (pt_raw, mass_raw, event_rho, pt_gen).
+
+    pt_gen is the pt of the matched gen jet, or ``nomatch_value`` when there is no match.
+    The legacy coffea factory expects 0 for "no match"; the correctionlib JERSmear node
+    expects -1 (0 falls in its scaling bin [0, 1) and gives factor = JERsf).
+    ``gen_match_dr``: when set, the NanoAOD gen match is also required to satisfy
+    dR < gen_match_dr (JME recommendation: R/2), otherwise the jet counts as unmatched.
+    (Backport of PocketCoffea PR #571.)
+    """
     jets["pt_raw"] = (1 - jets.rawFactor) * jets.pt
     jets["mass_raw"] = (1 - jets.rawFactor) * jets.mass
     jets["event_rho"] = ak.broadcast_arrays(event_rho, jets.pt)[0]
     if isMC:
         try:
-            jets["pt_gen"] = ak.values_astype(ak.fill_none(jets.matched_gen.pt, 0), np.float32)
+            gen = jets.matched_gen
+            pt_gen = ak.fill_none(gen.pt, nomatch_value)
+            if gen_match_dr is not None:
+                dr = ak.fill_none(jets.delta_r(gen), np.inf)
+                pt_gen = ak.where(dr < gen_match_dr, pt_gen, nomatch_value)
         except AttributeError:
-            jets["pt_gen"] = ak.zeros_like(jets.pt, dtype=np.float32)
+            # collection without gen match (e.g. CorrT1METJet)
+            pt_gen = ak.full_like(jets.pt, nomatch_value)
+        jets["pt_gen"] = ak.values_astype(pt_gen, np.float32)
     return jets
 
 def add_jec_variables_subjet(jets, event_rho, isMC=True):
@@ -437,6 +452,12 @@ def get_jersmear(_eval_dict, _ceval, _jer_sf_tag, _syst="nom"):
     return _eval_dict, _jersmear
 
 
+def safe_jersmear(smear):
+    # As in the JERC reference implementation: a non-finite or non-positive smear factor
+    # (a large negative random number on a low-pt jet) is replaced by 1.
+    return np.where(np.isfinite(smear) & (smear > 0), smear, 1.0)
+
+
 def jet_correction_corrlib(
     calib_params,
     variations,
@@ -493,7 +514,10 @@ def jet_correction_corrlib(
         rho = events.fixedGridRhoFastjetAll
     else:
         rho = events.Rho.fixedGridRhoFastjetAll
-    jets_jagged = add_jec_variables(jets_jagged, rho, isMC)
+    # Add variables needed for JEC and JER corrections (e.g. pt_raw, mass_raw, pt_gen, event_rho).
+    # JME gen matching for the JER: dR < R/2 on top of the NanoAOD genJetIdx match; -1 = no match.
+    cone = 0.8 if jet_type.startswith("AK8") else 0.4
+    jets_jagged = add_jec_variables(jets_jagged, rho, isMC, gen_match_dr=cone / 2, nomatch_value=-1.0)
 
     # flatten
 
@@ -524,6 +548,10 @@ def jet_correction_corrlib(
         jets["pt"] = sf_value * jets["pt_raw"]
         jets["mass"] = sf_value * jets["mass_raw"]
 
+    # The pt after the nominal JES is the input of both the JER (resolution, SF, smearing
+    # seed) and the JES uncertainties, as in the JERC reference implementation.
+    eval_dict.update({"JetPt": jets.pt})
+
     # jer central and systematics
     if apply_jer or jer_syst:
         # learned from: https://github.com/cms-nanoAOD/correctionlib/issues/130
@@ -535,7 +563,6 @@ def jet_correction_corrlib(
         # update evaluate dictionary
         eval_dict.update(
             {
-                "JetPt": jets.pt,
                 "GenPt": jets.pt_gen,
                 "EventID": jets.event_id,
             }
@@ -547,7 +574,9 @@ def jet_correction_corrlib(
         jer_ptres = ceval_jer[jer_ptres_tag].evaluate(*inputs_jer_ptres)
         # update evaluate dictionary
         eval_dict.update({"JER": jer_ptres})
-        # adjust pt gen
+        # adjust pt gen: the match is used (scaling method) only if |pt - pt_gen| < 3 sigma pt,
+        # otherwise GenPt = -1 selects the stochastic method in the JERSmear node.
+        # Unmatched jets already carry pt_gen = -1, which stays -1 in both branches.
         eval_dict.update(
             {
                 "GenPt": np.where(
@@ -560,15 +589,18 @@ def jet_correction_corrlib(
         )
         if apply_jer:
             eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "nom")
+            jersmear = safe_jersmear(jersmear)
             jets["pt_jer"] = jets.pt * jersmear
             jets["mass_jer"] = jets.mass * jersmear
         if jer_syst:
             # jer up
             eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "up")
+            jersmear = safe_jersmear(jersmear)
             jets["pt_JER_up"] = jets.pt * jersmear
             jets["mass_JER_up"] = jets.mass * jersmear
             # jer down
             eval_dict, jersmear = get_jersmear(eval_dict, ceval_jer, jer_sf_tag, "down")
+            jersmear = safe_jersmear(jersmear)
             jets["pt_JER_down"] = jets.pt * jersmear
             jets["mass_JER_down"] = jets.mass * jersmear
         if apply_jer:
@@ -586,11 +618,10 @@ def jet_correction_corrlib(
             jets["pt"] = jets["pt_jer"]
             jets["mass"] = jets["mass_jer"]
 
-    # jes systematics
-
+    # jes systematics: the uncertainty is evaluated at the pt after the nominal JES
+    # (eval_dict["JetPt"], not the smeared pt) and applied on the smeared pt, so the JES
+    # variations carry the same nominal JER smearing (same random number) as the nominal.
     if jes_syst:
-        # update evaluate dictionary
-        eval_dict.update({"JetPt": jets.pt})
         # loop over all JES variations
         jes_strings = [s[4:] for s in variations if s.startswith("JES")]
         for jes_vari in jes_strings:

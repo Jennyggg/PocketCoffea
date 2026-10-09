@@ -17,6 +17,13 @@ lepton_scale_factors:
       mvaFall17V2Iso_WP90: wp90iso
       mvaFall17V2noIso_WP80: wp80noiso
       mvaFall17V2noIso_WP90: wp90noiso
+      # cut-based (Fall17V2) IDs -- Electron.cutBased is cumulative
+      # (0=fail,1=veto,2=loose,3=medium,4=tight), so e.g. cutBased>=3 selects
+      # the "Medium" cut-based WP
+      cutBased_Veto: Veto
+      cutBased_Loose: Loose
+      cutBased_Medium: Medium
+      cutBased_Tight: Tight
 
     JSONfiles: 
       '2016_PreVFP':

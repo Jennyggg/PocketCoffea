@@ -343,6 +343,9 @@ def sf_btag(params, jets, year, njets, variations=["central"]):
     abseta = np.abs(ak.to_numpy(ak.flatten(jets.eta)))
     pt = ak.to_numpy(ak.flatten(jets.pt))
     discr = ak.to_numpy(ak.flatten(jets[btag_discriminator]))
+    # NaN discriminator values (e.g. for jets where the tagger didn't run) would
+    # cause correctionlib to crash with an out-of-bounds error; clip to [0, 1].
+    discr = np.nan_to_num(discr, nan=0.0).clip(0.0, 1.0)
 
     central_SF_byjet = corr.evaluate("central", flavour, abseta, pt, discr)
 
