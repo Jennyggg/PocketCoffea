@@ -2,13 +2,16 @@ import multiprocessing
 import os
 
 import click
-import pyarrow.dataset as ds
-import pyarrow.parquet as pq
 from rich import print
 from rich.progress import track
 
 
 def merge_leaf_dir(input_dir, output_file, force):
+    # Imported here, not at module level: this module is imported by the
+    # pocket-coffea CLI entry point, and loading pyarrow first pulls in the
+    # system libstdc++, which breaks xgboost/XRootD later in the same process.
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
     # Skip if output exists and not forcing
     if os.path.exists(output_file) and not force:
         print(f"[yellow][Skipped] Output exists: {output_file}[/]")
