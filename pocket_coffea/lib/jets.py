@@ -358,7 +358,7 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         return dijet, remnant
 
 
-def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag):
+def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag, jer_sfunc_tag=None):
     # learned from: https://github.com/cms-nanoAOD/correctionlib/issues/130
     with gzip.open(jer_json) as fin:
         cset = CorrectionSet.parse_raw(fin.read())
@@ -370,6 +370,7 @@ def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag):
         in (
             jer_ptres_tag,
             jer_sf_tag,
+            jer_sfunc_tag,
         )
     ]
     cset.compound_corrections = []
@@ -443,9 +444,22 @@ def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag):
     return ceval
 
 def get_jersmear(_eval_dict, _ceval, _jer_sf_tag, _syst="nom"):
-    _eval_dict.update({"systematic": _syst})
-    _inputs_jer_sf = [_eval_dict[input.name] for input in _ceval[_jer_sf_tag].inputs]
-    _jer_sf = _ceval[_jer_sf_tag].evaluate(*_inputs_jer_sf)
+    sf_inputs = [input.name for input in _ceval[_jer_sf_tag].inputs]
+    if "systematic" in sf_inputs:
+        # Old JER format: the ScaleFactor takes systematic = nom/up/down
+        _eval_dict.update({"systematic": _syst})
+        _jer_sf = _ceval[_jer_sf_tag].evaluate(*[_eval_dict[name] for name in sf_inputs])
+    else:
+        # New JER format (e.g. Summer22*_JRV2, Summer24Prompt24_JRV2): nominal ScaleFactor
+        # plus a separate SFUncertainty, up/down = SF * (1 +- unc) (as in upstream PocketCoffea).
+        # Evaluating only the ScaleFactor here would give up = down = nominal.
+        _jer_sf = _ceval[_jer_sf_tag].evaluate(*[_eval_dict[name] for name in sf_inputs])
+        if _syst != "nom":
+            sfunc_tag = _jer_sf_tag.replace("ScaleFactor", "SFUncertainty")
+            _sf_unc = _ceval[sfunc_tag].evaluate(
+                *[_eval_dict[input.name] for input in _ceval[sfunc_tag].inputs]
+            )
+            _jer_sf = _jer_sf * (1 + _sf_unc) if _syst == "up" else _jer_sf * (1 - _sf_unc)
     _eval_dict.update({"JERsf": _jer_sf})
     _inputs = [_eval_dict[input.name] for input in _ceval["JERSmear"].inputs]
     _jersmear = _ceval["JERSmear"].evaluate(*_inputs)
@@ -559,7 +573,8 @@ def jet_correction_corrlib(
         jer_ptres_tag = f"{jer_tag}_PtResolution_{jet_type}"
         jer_sf_tag = f"{jer_tag}_ScaleFactor_{jet_type}"
 
-        ceval_jer = get_jer_correction_set(json_path, jer_ptres_tag, jer_sf_tag)
+        jer_sfunc_tag = jer_sf_tag.replace("ScaleFactor", "SFUncertainty")
+        ceval_jer = get_jer_correction_set(json_path, jer_ptres_tag, jer_sf_tag, jer_sfunc_tag)
         # update evaluate dictionary
         eval_dict.update(
             {

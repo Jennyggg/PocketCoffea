@@ -259,9 +259,11 @@ class JetsCalibrator(Calibrator):
             out[jet_coll_name] = copy.copy(jets)
 
         if variation == "nominal" or variation not in self._variations:
-            # For nominal and unrelated variation return the nominal
-            # If the variation is nominal or not in the list of variations, we return the nominal values
-            return out
+            # For nominal and unrelated variation return the nominal values,
+            # sorted by corrected pt exactly as the varied collections below:
+            # otherwise order-dependent quantities (leading jets, firsts(...))
+            # differ between the nominal and every jet variation.
+            return self._sort_by_pt(out)
         
         # Otherwise, adapt pt and mass according to calibrations:
         # get the jet type from the variation name
@@ -292,11 +294,17 @@ class JetsCalibrator(Calibrator):
             out[jet_coll_name]["pt"] = self.jets_calibrated[jet_coll_name][f"pt_{variation_type}_down"]
             out[jet_coll_name]["mass"] = self.jets_calibrated[jet_coll_name][f"mass_{variation_type}_down"]
 
-        # Need to reorder the jet collection by pt after the variation
-        if self.jet_calib_param.sort_by_pt[self._year][jet_type]:
-            sorted_indices = ak.argsort(out[jet_coll_name]["pt"], axis=1, ascending=False)
-            out[jet_coll_name] = out[jet_coll_name][sorted_indices]
-   
+        # Need to reorder the jet collections by pt after the variation
+        return self._sort_by_pt(out)
+
+    def _sort_by_pt(self, out):
+        for jet_type, jet_coll_name in self.jet_calib_param.collection[self.year].items():
+            if jet_coll_name not in out:
+                continue
+            sort_cfg = self.jet_calib_param.sort_by_pt[self._year]
+            if jet_type in sort_cfg and sort_cfg[jet_type]:
+                sorted_indices = ak.argsort(out[jet_coll_name]["pt"], axis=1, ascending=False)
+                out[jet_coll_name] = out[jet_coll_name][sorted_indices]
         return out
 
 
