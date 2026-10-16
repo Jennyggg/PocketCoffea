@@ -141,7 +141,10 @@ class Style:
             return {
                 "year" : "years",
                 "cat" : "categories",
-                "variation" : "variations",
+                # data histograms carry only the "nominal" variation: keep it under its
+                # own name, otherwise it overwrites the MC variations and the
+                # systematic uncertainty band is silently reduced to MC stat only
+                "variation" : "variations_data",
                 "era" : "eras"
             }
 
